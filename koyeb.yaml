@@ -1,0 +1,6 @@
+# Koyeb.com Deploy uchun konfiguratsiya
+build:
+  builder: dockerfile
+
+run:
+  command: python main.py

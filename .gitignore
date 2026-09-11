@@ -1,0 +1,44 @@
+# Git versiya nazorati uchun e'tiborsiz fayllar
+
+# Muhim secrets va sozlamalar
+.env
+
+# Vaqtinchalik yuklab olingan fayllar
+downloads/
+*.mp3
+*.ogg
+*.m4a
+*.webm
+*.mp4
+*_thumb.jpg
+
+# Ma'lumotlar bazasi
+bot.db
+
+# Python kesh fayllari
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+venv/
+env/
+.venv/
+
+# Windows fayllar
+Thumbs.db
+desktop.ini
+
+# IDE fayllari
+.vscode/
+.idea/
+*.swp
+
+# Log fayllar
+*.log
+
+# Telethon session fayllari
+*.session
+*.session-journal
