@@ -91,7 +91,7 @@ class MusicSearchService:
             'http_headers': DEFAULT_HEADERS,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['ios', 'mweb']
+                    'player_client': ['android', 'web']
                 }
             },
         }
@@ -180,7 +180,7 @@ class MusicSearchService:
         expected_mp3 = str(DOWNLOADS_DIR / f"{output_id}.mp3")
         url = target if is_url(target) else f"https://www.youtube.com/watch?v={target}"
 
-        def build_dl_opts(clients: list, with_ffmpeg: bool = True):
+        def build_dl_opts(clients: Optional[list] = None, with_ffmpeg: bool = True):
             opts = {
                 'format': 'bestaudio/best',
                 'outtmpl': output_template,
@@ -191,12 +191,13 @@ class MusicSearchService:
                 'nocheckcertificate': True,
                 'socket_timeout': 30,
                 'http_headers': DEFAULT_HEADERS,
-                'extractor_args': {
+            }
+            if clients:
+                opts['extractor_args'] = {
                     'youtube': {
                         'player_client': clients
                     }
-                },
-            }
+                }
             if with_ffmpeg:
                 opts['postprocessors'] = [{
                     'key': 'FFmpegExtractAudio',
@@ -211,9 +212,11 @@ class MusicSearchService:
             return opts
 
         attempts = [
-            (build_dl_opts(['ios', 'mweb'], with_ffmpeg=True), "ios+mweb_mp3"),
-            (build_dl_opts(['mweb'], with_ffmpeg=True), "mweb_mp3"),
-            (build_dl_opts(['ios', 'mweb'], with_ffmpeg=False), "direct_audio_raw"),
+            (build_dl_opts(['android'], with_ffmpeg=True), "android_mp3"),
+            (build_dl_opts(['android_creator'], with_ffmpeg=True), "android_creator_mp3"),
+            (build_dl_opts(['tv_embedded'], with_ffmpeg=True), "tv_embedded_mp3"),
+            (build_dl_opts(None, with_ffmpeg=True), "default_mp3"),
+            (build_dl_opts(['android'], with_ffmpeg=False), "android_raw"),
         ]
 
         info = None
@@ -351,7 +354,8 @@ class MusicSearchService:
 
         info = None
         attempts = [
-            make_opts(['ios', 'mweb']),
+            make_opts(['android']),
+            make_opts(['android_creator']),
             make_opts(None),
         ]
 
@@ -424,78 +428,96 @@ class MusicSearchService:
 
         output_template = str(DOWNLOADS_DIR / f"{output_id}.%(ext)s")
 
-        ydl_opts = {
-            'format': fmt,
-            'outtmpl': output_template,
-            'merge_output_format': 'mp4',
-            'quiet': True,
-            'no_warnings': True,
-            'ignoreerrors': False,
-            'noplaylist': True,
-            'nocheckcertificate': True,
-            'socket_timeout': 45,
-            'retries': 3,
-            'http_headers': DEFAULT_HEADERS,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['ios', 'mweb']
+        def build_video_opts(clients: Optional[list] = None):
+            ydl_opts = {
+                'format': fmt,
+                'outtmpl': output_template,
+                'merge_output_format': 'mp4',
+                'quiet': True,
+                'no_warnings': True,
+                'ignoreerrors': False,
+                'noplaylist': True,
+                'nocheckcertificate': True,
+                'socket_timeout': 45,
+                'retries': 3,
+                'http_headers': DEFAULT_HEADERS,
+                'postprocessor_args': {
+                    'Merger': ['-threads', '4']
                 }
-            },
-            'postprocessor_args': {
-                'Merger': ['-threads', '4']
             }
-        }
-        if self.ffmpeg_location:
-            ydl_opts['ffmpeg_location'] = self.ffmpeg_location
+            if clients:
+                ydl_opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': clients
+                    }
+                }
+            if self.ffmpeg_location:
+                ydl_opts['ffmpeg_location'] = self.ffmpeg_location
+            return ydl_opts
+
+        attempts = [
+            build_video_opts(['android']),
+            build_video_opts(['android_creator']),
+            build_video_opts(None),
+        ]
+
+        info = None
+        for opts in attempts:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info:
+                        break
+            except Exception as e:
+                logger.warning(f"Video yuklab olishda xatolik: {e}")
+                continue
+
+        if not info:
+            return None
+        if 'entries' in info:
+            entries = [e for e in (info['entries'] or []) if e]
+            if not entries:
+                return None
+            info = entries[0]
 
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    return None
-                if 'entries' in info:
-                    entries = [e for e in (info['entries'] or []) if e]
-                    if not entries:
-                        return None
-                    info = entries[0]
+            raw_title = info.get('title') or "Video"
+            duration = int(info.get('duration') or 0)
+            thumb = info.get('thumbnail')
+            width = info.get('width')
+            height = info.get('height')
 
-                raw_title = info.get('title') or "Video"
-                duration = int(info.get('duration') or 0)
-                thumb = info.get('thumbnail')
-                width = info.get('width')
-                height = info.get('height')
+            # Yuklab olingan faylni topish
+            mp4_files = glob.glob(str(DOWNLOADS_DIR / f"{output_id}.mp4"))
+            if not mp4_files:
+                all_files = glob.glob(str(DOWNLOADS_DIR / f"{output_id}.*"))
+                video_exts = {'.mp4', '.mkv', '.webm', '.avi', '.mov'}
+                mp4_files = [f for f in all_files if os.path.splitext(f)[1].lower() in video_exts]
 
-                # Yuklab olingan faylni topish
-                mp4_files = glob.glob(str(DOWNLOADS_DIR / f"{output_id}.mp4"))
-                if not mp4_files:
-                    all_files = glob.glob(str(DOWNLOADS_DIR / f"{output_id}.*"))
-                    video_exts = {'.mp4', '.mkv', '.webm', '.avi', '.mov'}
-                    mp4_files = [f for f in all_files if os.path.splitext(f)[1].lower() in video_exts]
+            if not mp4_files:
+                logger.error(f"Yuklab olingan video fayl topilmadi: {output_id}")
+                return None
 
-                if not mp4_files:
-                    logger.error(f"Yuklab olingan video fayl topilmadi: {output_id}")
-                    return None
+            video_path = mp4_files[0]
+            file_size = os.path.getsize(video_path)
 
-                video_path = mp4_files[0]
-                file_size = os.path.getsize(video_path)
+            if file_size < 1024:  # 1KB dan kichik bo'lsa yaroqsiz
+                logger.error(f"Yuklab olingan video fayl juda kichik ({file_size} bytes): {video_path}")
+                try:
+                    os.remove(video_path)
+                except Exception:
+                    pass
+                return None
 
-                if file_size < 1024:  # 1KB dan kichik bo'lsa yaroqsiz
-                    logger.error(f"Yuklab olingan video fayl juda kichik ({file_size} bytes): {video_path}")
-                    try:
-                        os.remove(video_path)
-                    except Exception:
-                        pass
-                    return None
-
-                return {
-                    'file_path': video_path,
-                    'title': clean_title(raw_title),
-                    'duration': duration,
-                    'width': width or 1280,
-                    'height': height or 720,
-                    'file_size': file_size,
-                    'thumbnail_url': thumb
-                }
+            return {
+                'file_path': video_path,
+                'title': clean_title(raw_title),
+                'duration': duration,
+                'width': width or 1280,
+                'height': height or 720,
+                'file_size': file_size,
+                'thumbnail_url': thumb
+            }
         except Exception as e:
             logger.error(f"Videoni yuklashda xatolik ({url}, {max_height}p): {e}")
             for leftover in glob.glob(str(DOWNLOADS_DIR / f"{output_id}.*")):
