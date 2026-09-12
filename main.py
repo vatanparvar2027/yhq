@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 import sys
@@ -62,6 +63,24 @@ async def main():
     dp.include_router(inline_router)
     dp.include_router(story_router)
     dp.include_router(search_router)
+
+    # Render / Koyeb Web Service port listener (Health Check)
+    port = int(os.environ.get("PORT", 0))
+    if port > 0:
+        try:
+            from aiohttp import web
+            async def health_check(request):
+                return web.Response(text="OK - @ChiroqchiMuzbot is active!")
+            app = web.Application()
+            app.router.add_get("/", health_check)
+            app.router.add_get("/health", health_check)
+            runner = web.AppRunner(app)
+            await runner.setup()
+            site = web.TCPSite(runner, "0.0.0.0", port)
+            await site.start()
+            logger.info(f"Render/Koyeb web server port {port} da ishga tushirildi.")
+        except Exception as e:
+            logger.warning(f"Web server ishga tushirishda xatolik: {e}")
 
     # Eski kutilmagan xabarlarni tozalash va polling boshlash
     try:

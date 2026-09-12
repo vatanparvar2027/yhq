@@ -22,6 +22,13 @@ URL_REGEX = re.compile(
     r'(?:/?|[/?]\S+)$', re.IGNORECASE
 )
 
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,uz;q=0.8',
+    'Sec-Fetch-Mode': 'navigate',
+}
+
 def is_url(text: str) -> bool:
     """Matn havola (URL) ekanligini tekshirish"""
     return bool(URL_REGEX.match(text.strip()))
@@ -80,8 +87,13 @@ class MusicSearchService:
             'skip_download': True,
             'ignoreerrors': True,
             'nocheckcertificate': True,
-            'source_address': '0.0.0.0',
-            'socket_timeout': 10,
+            'socket_timeout': 20,
+            'http_headers': DEFAULT_HEADERS,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['ios', 'mweb']
+                }
+            },
         }
         if self.ffmpeg_location:
             ydl_opts['ffmpeg_location'] = self.ffmpeg_location
@@ -162,115 +174,130 @@ class MusicSearchService:
 
     def _sync_download(self, target: str, output_id: str) -> Optional[Dict[str, Any]]:
         """
-        Tezlashtirilgan ko'p oqimli yuklab olish va FFmpeg konvertatsiya
+        Tezlashtirilgan ko'p oqimli yuklab olish va FFmpeg konvertatsiya (Multi-tier retry)
         """
         output_template = str(DOWNLOADS_DIR / f"{output_id}.%(ext)s")
         expected_mp3 = str(DOWNLOADS_DIR / f"{output_id}.mp3")
+        url = target if is_url(target) else f"https://www.youtube.com/watch?v={target}"
 
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
-            'outtmpl': output_template,
-            'quiet': True,
-            'no_warnings': True,
-            'ignoreerrors': False,
-            'noplaylist': True,
-            'nocheckcertificate': True,
-            'socket_timeout': 10,
-            'source_address': '0.0.0.0',
-            'concurrent_fragment_downloads': 4,
-            'buffersize': 1024 * 1024,
-            'http_chunk_size': 10485760,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'web']
-                }
-            },
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }],
-            'postprocessor_args': {
-                'FFmpegExtractAudio': ['-threads', '4']
+        def build_dl_opts(clients: list, with_ffmpeg: bool = True):
+            opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': output_template,
+                'quiet': True,
+                'no_warnings': True,
+                'ignoreerrors': False,
+                'noplaylist': True,
+                'nocheckcertificate': True,
+                'socket_timeout': 30,
+                'http_headers': DEFAULT_HEADERS,
+                'extractor_args': {
+                    'youtube': {
+                        'player_client': clients
+                    }
+                },
             }
-        }
-        if self.ffmpeg_location:
-            ydl_opts['ffmpeg_location'] = self.ffmpeg_location
-
-        try:
-            url = target if is_url(target) else f"https://www.youtube.com/watch?v={target}"
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                if not info:
-                    return None
-
-                if 'entries' in info:
-                    entries = list(info['entries'])
-                    if not entries:
-                        return None
-                    info = entries[0]
-
-                video_id = info.get('id') or output_id
-                raw_title = info.get('title') or "Musiqa"
-                artist = (info.get('artist') or info.get('uploader') or "Noma'lum").replace(" - Topic", "").strip()
-                duration = int(info.get('duration') or 0)
-                thumb_url = info.get('thumbnail')
-
-                mp3_path = expected_mp3
-                if not os.path.exists(mp3_path):
-                    for ext in ['.mp3', '.m4a', '.webm']:
-                        alt = str(DOWNLOADS_DIR / f"{output_id}{ext}")
-                        if os.path.exists(alt):
-                            mp3_path = alt
-                            break
-
-                # Agar MP3 hajmi Telegram limitidan (50MB) katta bo'lsa (konsertlar), uni 46MB ga moslab siqamiz
-                if os.path.exists(mp3_path):
-                    file_size = os.path.getsize(mp3_path)
-                    MAX_TELEGRAM_AUDIO_BYTES = 49 * 1024 * 1024  # 49 MB
-                    if file_size > MAX_TELEGRAM_AUDIO_BYTES and duration > 0:
-                        logger.info(f"Katta audio fayl: {round(file_size / (1024 * 1024), 1)} MB ({duration}s). 50MB ichiga optimallash...")
-                        target_kbps = max(24, min(128, int((45 * 1024 * 8) / duration)))
-                        compressed_mp3 = str(DOWNLOADS_DIR / f"{output_id}_opt.mp3")
-
-                        ffmpeg_bin = "ffmpeg"
-                        if self.ffmpeg_location:
-                            candidate = os.path.join(self.ffmpeg_location, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
-                            if os.path.exists(candidate):
-                                ffmpeg_bin = candidate
-
-                        import subprocess
-                        cmd = [
-                            ffmpeg_bin, "-y", "-i", mp3_path,
-                            "-b:a", f"{target_kbps}k",
-                            "-threads", "4",
-                            compressed_mp3
-                        ]
-                        try:
-                            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
-                            if res.returncode == 0 and os.path.exists(compressed_mp3):
-                                comp_size = os.path.getsize(compressed_mp3)
-                                if comp_size < MAX_TELEGRAM_AUDIO_BYTES:
-                                    try:
-                                        os.remove(mp3_path)
-                                    except Exception:
-                                        pass
-                                    mp3_path = compressed_mp3
-                                    logger.info(f"Audio muvaffaqiyatli siqildi: {round(comp_size / (1024 * 1024), 1)} MB ({target_kbps} kbps)")
-                        except Exception as comp_err:
-                            logger.warning(f"Audio optimallashtirishda xatolik: {comp_err}")
-
-                return {
-                    'id': video_id,
-                    'file_path': mp3_path,
-                    'title': clean_title(raw_title),
-                    'artist': artist,
-                    'duration': duration,
-                    'thumbnail_url': thumb_url
+            if with_ffmpeg:
+                opts['postprocessors'] = [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }]
+                opts['postprocessor_args'] = {
+                    'FFmpegExtractAudio': ['-threads', '4']
                 }
-        except Exception as e:
-            logger.error(f"Yuklab olishda xatolik ({target}): {e}")
+                if self.ffmpeg_location:
+                    opts['ffmpeg_location'] = self.ffmpeg_location
+            return opts
+
+        attempts = [
+            (build_dl_opts(['ios', 'mweb'], with_ffmpeg=True), "ios+mweb_mp3"),
+            (build_dl_opts(['mweb'], with_ffmpeg=True), "mweb_mp3"),
+            (build_dl_opts(['ios', 'mweb'], with_ffmpeg=False), "direct_audio_raw"),
+        ]
+
+        info = None
+        for opts, mode in attempts:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                    if info:
+                        break
+            except Exception as e:
+                logger.warning(f"Audio yuklab olishda ({mode}) urinishi xatosi: {e}")
+                continue
+
+        if not info:
+            logger.error(f"Barcha audio yuklab olish urinishlari muvaffaqiyatsiz bo'ldi ({target})")
             return None
+
+        if 'entries' in info:
+            entries = [e for e in info['entries'] if e]
+            if not entries:
+                return None
+            info = entries[0]
+
+        video_id = info.get('id') or output_id
+        raw_title = info.get('title') or "Musiqa"
+        artist = (info.get('artist') or info.get('uploader') or "Noma'lum").replace(" - Topic", "").strip()
+        duration = int(info.get('duration') or 0)
+        thumb_url = info.get('thumbnail')
+
+        mp3_path = expected_mp3
+        if not os.path.exists(mp3_path):
+            for ext in ['.mp3', '.m4a', '.webm', '.ogg', '.opus', '.mp4']:
+                alt = str(DOWNLOADS_DIR / f"{output_id}{ext}")
+                if os.path.exists(alt):
+                    mp3_path = alt
+                    break
+
+        if not os.path.exists(mp3_path):
+            logger.error(f"Yuklab olingan fayl topilmadi: {output_id}")
+            return None
+
+        # Agar MP3 hajmi Telegram limitidan (49MB) katta bo'lsa (konsertlar), uni 46MB ga moslab siqamiz
+        file_size = os.path.getsize(mp3_path)
+        MAX_TELEGRAM_AUDIO_BYTES = 49 * 1024 * 1024  # 49 MB
+        if file_size > MAX_TELEGRAM_AUDIO_BYTES and duration > 0:
+            logger.info(f"Katta audio fayl: {round(file_size / (1024 * 1024), 1)} MB ({duration}s). 49MB ichiga siqish...")
+            target_kbps = max(24, min(128, int((45 * 1024 * 8) / duration)))
+            compressed_mp3 = str(DOWNLOADS_DIR / f"{output_id}_opt.mp3")
+
+            ffmpeg_bin = "ffmpeg"
+            if self.ffmpeg_location:
+                candidate = os.path.join(self.ffmpeg_location, "ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+                if os.path.exists(candidate):
+                    ffmpeg_bin = candidate
+
+            import subprocess
+            cmd = [
+                ffmpeg_bin, "-y", "-i", mp3_path,
+                "-b:a", f"{target_kbps}k",
+                "-threads", "4",
+                compressed_mp3
+            ]
+            try:
+                res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+                if res.returncode == 0 and os.path.exists(compressed_mp3):
+                    comp_size = os.path.getsize(compressed_mp3)
+                    if comp_size < MAX_TELEGRAM_AUDIO_BYTES:
+                        try:
+                            os.remove(mp3_path)
+                        except Exception:
+                            pass
+                        mp3_path = compressed_mp3
+                        logger.info(f"Audio muvaffaqiyatli siqildi: {round(comp_size / (1024 * 1024), 1)} MB ({target_kbps} kbps)")
+            except Exception as comp_err:
+                logger.warning(f"Audio optimallashtirishda xatolik: {comp_err}")
+
+        return {
+            'id': video_id,
+            'file_path': mp3_path,
+            'title': clean_title(raw_title),
+            'artist': artist,
+            'duration': duration,
+            'thumbnail_url': thumb_url
+        }
 
     async def download(self, target: str, output_id: str, thumb_url_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
@@ -301,63 +328,79 @@ class MusicSearchService:
         return data
 
     def _sync_get_media_info(self, url: str) -> Optional[Dict[str, Any]]:
-        """Havola haqida tezkor ma'lumot olish (title, duration, mavjud formatlar)"""
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'skip_download': True,
-            'ignoreerrors': True,
-            'nocheckcertificate': True,
-            'socket_timeout': 10,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'ios', 'web']
+        """Havola haqida tezkor ma'lumot olish (YouTube, TikTok, Instagram va boshqa platformalar)"""
+        def make_opts(player_clients=None):
+            opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'skip_download': True,
+                'ignoreerrors': False,
+                'nocheckcertificate': True,
+                'socket_timeout': 30,
+                'http_headers': DEFAULT_HEADERS,
+            }
+            if player_clients:
+                opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': player_clients
+                    }
                 }
-            },
-        }
-        if self.ffmpeg_location:
-            ydl_opts['ffmpeg_location'] = self.ffmpeg_location
+            if self.ffmpeg_location:
+                opts['ffmpeg_location'] = self.ffmpeg_location
+            return opts
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if not info:
-                    return None
-                if 'entries' in info:
-                    entries = list(info['entries'])
-                    if not entries:
-                        return None
-                    info = entries[0]
+        info = None
+        attempts = [
+            make_opts(['ios', 'mweb']),
+            make_opts(None),
+        ]
 
-                raw_title = info.get('title') or "Video"
-                artist = (info.get('artist') or info.get('uploader') or info.get('channel') or "Noma'lum").replace(" - Topic", "").strip()
-                duration = int(info.get('duration') or 0)
-                duration_str = format_duration(duration)
-                thumb = info.get('thumbnail')
-                video_id = info.get('id') or f"vid_{int(time.time())}"
+        for opts in attempts:
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info:
+                        break
+            except Exception as e:
+                logger.warning(f"Media ma'lumotini olishda ogohlantirish ({url}): {e}")
+                continue
 
-                # Mavjud sifatlarni aniqlash
-                formats = info.get('formats', [])
-                heights = set()
-                for f in formats:
-                    h = f.get('height')
-                    if h and isinstance(h, int):
-                        heights.add(h)
-
-                return {
-                    'id': video_id,
-                    'title': clean_title(raw_title),
-                    'raw_title': raw_title,
-                    'artist': artist,
-                    'duration': duration,
-                    'duration_str': duration_str,
-                    'thumbnail': thumb,
-                    'available_heights': sorted(list(heights), reverse=True),
-                    'url': url
-                }
-        except Exception as e:
-            logger.error(f"Media ma'lumotini olishda xatolik ({url}): {e}")
+        if not info:
+            logger.error(f"Media ma'lumoti topilmadi ({url})")
             return None
+
+        if 'entries' in info:
+            entries = [e for e in (info.get('entries') or []) if e]
+            if not entries:
+                return None
+            info = entries[0]
+
+        raw_title = info.get('title') or "Video"
+        artist = (info.get('artist') or info.get('uploader') or info.get('channel') or "Noma'lum").replace(" - Topic", "").strip()
+        duration = int(info.get('duration') or 0)
+        duration_str = format_duration(duration)
+        thumb = info.get('thumbnail')
+        video_id = info.get('id') or f"vid_{int(time.time())}"
+
+        # Mavjud sifatlarni aniqlash
+        formats = info.get('formats', [])
+        heights = set()
+        for f in formats:
+            h = f.get('height')
+            if h and isinstance(h, int):
+                heights.add(h)
+
+        return {
+            'id': video_id,
+            'title': clean_title(raw_title),
+            'raw_title': raw_title,
+            'artist': artist,
+            'duration': duration,
+            'duration_str': duration_str,
+            'thumbnail': thumb,
+            'available_heights': sorted(list(heights), reverse=True),
+            'url': url
+        }
 
     async def get_media_info(self, url: str) -> Optional[Dict[str, Any]]:
         """Asinxron media ma'lumoti oluvchi"""
@@ -370,7 +413,6 @@ class MusicSearchService:
         """
         import glob
 
-        # Format tanlash zanjiri: kerakli sifat -> undan past eng yaxshi -> umumiy eng yaxshi
         if max_height >= 2160:
             fmt = 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/bestvideo+bestaudio/best'
         elif max_height >= 1080:
@@ -391,11 +433,12 @@ class MusicSearchService:
             'ignoreerrors': False,
             'noplaylist': True,
             'nocheckcertificate': True,
-            'socket_timeout': 30,
+            'socket_timeout': 45,
             'retries': 3,
+            'http_headers': DEFAULT_HEADERS,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'ios', 'web']
+                    'player_client': ['ios', 'mweb']
                 }
             },
             'postprocessor_args': {
@@ -425,9 +468,7 @@ class MusicSearchService:
                 # Yuklab olingan faylni topish
                 mp4_files = glob.glob(str(DOWNLOADS_DIR / f"{output_id}.mp4"))
                 if not mp4_files:
-                    # Boshqa kengaytmalarni ham tekshiramiz
                     all_files = glob.glob(str(DOWNLOADS_DIR / f"{output_id}.*"))
-                    # .jpg va .webp kabi rasm fayllarini chiqarib tashlaymiz
                     video_exts = {'.mp4', '.mkv', '.webm', '.avi', '.mov'}
                     mp4_files = [f for f in all_files if os.path.splitext(f)[1].lower() in video_exts]
 
@@ -440,7 +481,10 @@ class MusicSearchService:
 
                 if file_size < 1024:  # 1KB dan kichik bo'lsa yaroqsiz
                     logger.error(f"Yuklab olingan video fayl juda kichik ({file_size} bytes): {video_path}")
-                    os.remove(video_path)
+                    try:
+                        os.remove(video_path)
+                    except Exception:
+                        pass
                     return None
 
                 return {
@@ -454,7 +498,6 @@ class MusicSearchService:
                 }
         except Exception as e:
             logger.error(f"Videoni yuklashda xatolik ({url}, {max_height}p): {e}")
-            # Qisman yuklab olingan fayllarni tozalash
             for leftover in glob.glob(str(DOWNLOADS_DIR / f"{output_id}.*")):
                 try:
                     os.remove(leftover)

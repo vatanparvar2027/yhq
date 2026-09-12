@@ -17,7 +17,13 @@ ADMINS = [int(admin_id.strip()) for admin_id in ADMINS_RAW.split(",") if admin_i
 CHANNELS_RAW = os.getenv("CHANNELS", "").strip()
 CHANNELS = [ch.strip() for ch in CHANNELS_RAW.split(",") if ch.strip()]
 
-# FFmpeg — serverda (Docker) ffmpeg sistem yo'lida bo'ladi, lokal uchun yo'l aniqlanadi
+# FFmpeg — avtomatik static-ffmpeg yoki lokal/tizim ffmpeg dan foydalanadi
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception:
+    pass
+
 _default_ffmpeg_local = r"E:\Botlarim\ffmpeg-2026-06-01-git-bf608f16fd-essentials_build\bin"
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", _default_ffmpeg_local).strip()
 

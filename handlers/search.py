@@ -443,9 +443,9 @@ async def handle_download_callback(call: CallbackQuery):
         await progress_msg.edit_text("❌ Musiqani yuborishda xatolik yuz berdi.")
     finally:
         try:
-            if os.path.exists(audio_data['file_path']):
+            if audio_data and audio_data.get('file_path') and os.path.exists(audio_data['file_path']):
                 os.remove(audio_data['file_path'])
-            if audio_data.get('cover_path') and os.path.exists(audio_data['cover_path']):
+            if audio_data and audio_data.get('cover_path') and "bot_avatar" not in str(audio_data['cover_path']) and os.path.exists(audio_data['cover_path']):
                 os.remove(audio_data['cover_path'])
         except Exception:
             pass
@@ -586,9 +586,9 @@ async def handle_url_audio_download(call: CallbackQuery):
         await progress_msg.edit_text("❌ Telegramga audio yuborishda xatolik yuz berdi.")
     finally:
         try:
-            if os.path.exists(audio_data['file_path']):
+            if audio_data and audio_data.get('file_path') and os.path.exists(audio_data['file_path']):
                 os.remove(audio_data['file_path'])
-            if audio_data.get('cover_path') and os.path.exists(audio_data['cover_path']):
+            if audio_data and audio_data.get('cover_path') and "bot_avatar" not in str(audio_data['cover_path']) and os.path.exists(audio_data['cover_path']):
                 os.remove(audio_data['cover_path'])
         except Exception:
             pass

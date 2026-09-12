@@ -1,6 +1,7 @@
 aiogram>=3.17.0,<4.0.0
 yt-dlp>=2026.1.1
-shazamio>=0.8.0
+shazamio==0.8.1
+shazamio-core==1.1.2
 mutagen>=1.48.0
 aiosqlite>=0.21.0
 python-dotenv>=1.0.0
@@ -8,3 +9,4 @@ aiohttp>=3.10.0
 aiofiles>=23.2.0
 telethon>=1.38.0
 pillow>=10.0.0
+static-ffmpeg>=2.5
