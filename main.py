@@ -113,7 +113,7 @@ async def main():
         print(f"🎵 Bot faol: @{bot_info.username}")
         print("Musiqa qidirish, Shazam va yuklash tizimlari tayyor!")
         print("="*50 + "\n")
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         await bot.session.close()
 

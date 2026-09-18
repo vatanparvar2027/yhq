@@ -9,7 +9,7 @@ from aiogram.types import Message, CallbackQuery, FSInputFile
 from aiogram.enums import ChatAction
 
 from database.db import db
-from services.music_search import music_service, is_url, format_duration
+from services.music_search import music_service, is_url, extract_url, clean_url, format_duration
 from keyboards.inline_kb import build_search_keyboard, get_audio_keyboard, get_media_choice_keyboard
 from handlers.start import check_user_subscription
 from keyboards.inline_kb import get_channel_sub_keyboard
@@ -250,14 +250,20 @@ async def handle_new_chat_members(message: Message):
             )
             break
 
-@search_router.message(F.text & ~F.text.startswith("/"))
+@search_router.message(F.text | F.caption)
 async def handle_text_search(message: Message):
     user = message.from_user
-    text = message.text.strip()
+    raw_text = (message.text or message.caption or "").strip()
+    if not raw_text or raw_text.startswith("/"):
+        return
+
     is_group = message.chat.type in ["group", "supergroup"]
 
-    # 1. Agar havola (URL) yuborilgan bo'lsa (ham guruhda, ham shaxsiy chatda ishlaydi)
-    if is_url(text):
+    # 1. Matn yoki izoh (caption) ichidan havola (Instagram, YouTube, TikTok va b.) qidiramiz
+    detected_url = extract_url(raw_text)
+    if detected_url:
+        target_url = detected_url
+
         # Avval obunani tekshiramiz (shaxsiy chatda)
         if not is_group:
             is_subscribed = await check_user_subscription(message.bot, user.id)
@@ -265,7 +271,7 @@ async def handle_text_search(message: Message):
                 # URL so'rovini eslab qolamiz
                 PENDING_REQUESTS[user.id] = {
                     "type": "url",
-                    "query": text,
+                    "query": target_url,
                     "time": time.time()
                 }
                 all_channels = await _get_all_channels(message.bot)
@@ -281,14 +287,22 @@ async def handle_text_search(message: Message):
         status_msg = await message.reply("🔍 <b>Havola tekshirilmoqda...</b>", parse_mode="HTML")
         await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-        info = await music_service.get_media_info(text)
+        info = await music_service.get_media_info(target_url)
         if not info:
-            await status_msg.edit_text("❌ Ushbu havola orqali media topilmadi yoki havola noto'g'ri/yopiq.")
+            await status_msg.edit_text(
+                "❌ <b>Ushbu havola orqali media topilmadi.</b>\n\n"
+                "<i>Ehtimoliy sabablar:</i>\n"
+                "• Profil yopiq (private) yoki post o'chirilgan bo'lishi mumkin\n"
+                "• Havola noto'g'ri ko'chirilgan\n"
+                "• Platforma yuklashni cheklagan bo'lishi mumkin\n\n"
+                "💡 <i>Iltimos, ochiq post havolasini yuboring yoki boshqa video sinab ko'ring.</i>",
+                parse_mode="HTML"
+            )
             return
 
         url_key = f"u_{user.id}_{int(time.time() * 1000) % 10000000}"
         URL_CACHE[url_key] = {
-            "url": text,
+            "url": target_url,
             "info": info,
             "time": time.time()
         }
@@ -330,21 +344,21 @@ async def handle_text_search(message: Message):
         bot_info = await message.bot.get_me()
         bot_mention = f"@{bot_info.username}".lower()
         # Agar bot nomini yozib qidirishsa (masalan: @ChiroqchiMuzbot Konsta)
-        if text.lower().startswith(bot_mention):
-            query = text[len(bot_mention):].strip()
+        if raw_text.lower().startswith(bot_mention):
+            query = raw_text[len(bot_mention):].strip()
             if query:
                 await execute_search(message, query)
             return
         # Agar botning xabariga javoban (reply) yozilgan bo'lsa
         elif message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_info.id:
-            await execute_search(message, text)
+            await execute_search(message, raw_text)
             return
         else:
             # Guruhdagi boshqa oddiy suhbatlarga bot xalaqit bermaydi
             return
 
-    # 3. Shaxsiy chatda har qanday matn orqali to'g'ridan-to'g'ri qidiruv
-    await execute_search(message, text)
+    # 3. Shaxsiy chatda har qanday matn orqali to'g'ridan-to'g'ri musiqa qidiruv
+    await execute_search(message, raw_text)
 
 @search_router.callback_query(F.data.startswith("dl:"))
 async def handle_download_callback(call: CallbackQuery):
@@ -383,21 +397,31 @@ async def handle_download_callback(call: CallbackQuery):
         return
 
     # 3. Agar keshda bo'lmasa, yuklab olamiz
-    # Qidiruv keshida muqova rasmi va konsert holati bormi
+    # Qidiruv keshida muqova rasmi, konsert holati va qo'shiq nomi
     thumb_hint = None
     is_concert = False
+    fallback_query = None
     cached_search = USER_SEARCH_CACHE.get(user_id, {})
     for item in cached_search.get("results", []):
         if item.get("id") == video_id:
             thumb_hint = item.get("thumbnail")
             is_concert = item.get("is_concert", False)
+            t_name = item.get("title", "")
+            a_name = item.get("artist", "")
+            if t_name:
+                fallback_query = f"{a_name} - {t_name}".strip(" -")
             break
 
     loading_text = "⚡️ <i>[1/2] Konsert dasturi yuklab olinmoqda va tayyorlanmoqda...</i>" if is_concert else "⚡️ <i>[1/2] Musiqa yuklab olinmoqda va tayyorlanmoqda...</i>"
     progress_msg = await call.message.answer(loading_text, parse_mode="HTML")
     await call.bot.send_chat_action(call.message.chat.id, ChatAction.RECORD_VOICE)
 
-    audio_data = await music_service.download(video_id, video_id, thumb_url_hint=thumb_hint)
+    audio_data = await music_service.download(
+        target=video_id,
+        output_id=video_id,
+        thumb_url_hint=thumb_hint,
+        fallback_query=fallback_query
+    )
     if not audio_data:
         await progress_msg.edit_text("❌ Musiqani yuklab olishda xatolik yuz berdi. Boshqa variantni tanlab ko'ring.")
         return

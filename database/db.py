@@ -55,6 +55,13 @@ class Database:
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Kanallar jadvalini xavfsiz kengaytirish (migratsiya)
+            for col in ["chat_id TEXT", "title TEXT", "invite_link TEXT"]:
+                try:
+                    await db.execute(f"ALTER TABLE channels ADD COLUMN {col};")
+                except Exception:
+                    pass
+
             await db.commit()
 
             # Barcha oldin yuklangan musiqalarni RAM keshiga yuklab olamiz (0ms tezlik uchun)
@@ -85,14 +92,19 @@ class Database:
         self._ram_cache.clear()
         return count
 
-    async def add_channel(self, username: str) -> bool:
+    async def add_channel(self, username: str, chat_id: Optional[str] = None, title: Optional[str] = None, invite_link: Optional[str] = None) -> bool:
         """Majburiy obuna kanalini qo'shish"""
         username = username.strip()
-        if not username.startswith("@") and not username.startswith("http"):
-            username = "@" + username
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("INSERT OR IGNORE INTO channels (username) VALUES (?)", (username,))
+                await db.execute("""
+                    INSERT INTO channels (username, chat_id, title, invite_link)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(username) DO UPDATE SET
+                        chat_id = COALESCE(excluded.chat_id, channels.chat_id),
+                        title = COALESCE(excluded.title, channels.title),
+                        invite_link = COALESCE(excluded.invite_link, channels.invite_link)
+                """, (username, str(chat_id) if chat_id else None, title, invite_link))
                 await db.commit()
                 return True
         except Exception:
@@ -103,19 +115,30 @@ class Database:
         username = username.strip()
         try:
             async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("DELETE FROM channels WHERE username = ?", (username,))
+                await db.execute("DELETE FROM channels WHERE username = ? OR chat_id = ?", (username, username))
                 await db.commit()
                 return True
         except Exception:
             return False
 
     async def get_db_channels(self) -> List[str]:
-        """Bazadagi majburiy kanallar ro'yxati"""
+        """Bazadagi majburiy kanallar ro'yxati (username yoki havola)"""
         try:
             async with aiosqlite.connect(self.db_path) as db:
                 cursor = await db.execute("SELECT username FROM channels")
                 rows = await cursor.fetchall()
                 return [row[0] for row in rows]
+        except Exception:
+            return []
+
+    async def get_db_channels_full(self) -> List[Dict[str, Any]]:
+        """Bazadagi barcha kanallarni to'liq ma'lumotlari bilan olish"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = aiosqlite.Row
+                cursor = await db.execute("SELECT id, username, chat_id, title, invite_link FROM channels")
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
         except Exception:
             return []
 

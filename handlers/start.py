@@ -17,23 +17,70 @@ logger = logging.getLogger(__name__)
 start_router = Router()
 
 async def get_all_active_channels() -> list:
-    """Barcha faol majburiy obuna kanallarini olish (.env + baza)"""
-    db_channels = await db.get_db_channels()
-    return list(dict.fromkeys(CHANNELS + db_channels))
+    """Barcha faol majburiy obuna kanallarini to'liq formatda olish (.env + baza)"""
+    full_db_channels = await db.get_db_channels_full()
+    result = []
+    seen = set()
+
+    for ch in full_db_channels:
+        key = ch.get('username') or ch.get('chat_id')
+        if key and key not in seen:
+            seen.add(key)
+            result.append(ch)
+
+    for env_ch in CHANNELS:
+        env_ch = env_ch.strip()
+        if env_ch and env_ch not in seen:
+            seen.add(env_ch)
+            result.append({
+                'username': env_ch,
+                'chat_id': None,
+                'title': None,
+                'invite_link': None
+            })
+    return result
 
 async def check_user_subscription(bot, user_id: int) -> bool:
-    """Foydalanuvchi majburiy kanallarga a'zo bo'lganligini tekshirish"""
+    """Foydalanuvchi barcha majburiy kanallarga a'zo bo'lganligini aniq va xatosiz tekshirish"""
     all_channels = await get_all_active_channels()
     if not all_channels:
         return True
 
-    for channel in all_channels:
-        try:
-            member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-            if member.status not in ["creator", "administrator", "member", "restricted"]:
-                return False
-        except Exception:
+    for ch in all_channels:
+        chat_target = None
+        if isinstance(ch, dict):
+            chat_target = ch.get('chat_id') or ch.get('username')
+        else:
+            chat_target = str(ch).strip()
+
+        if not chat_target:
             continue
+
+        # Agar username yoki havola bo'lsa, tozalaymiz
+        if isinstance(chat_target, str):
+            chat_target = chat_target.strip()
+            if "t.me/" in chat_target:
+                part = chat_target.split("t.me/", 1)[1].strip("/")
+                if not part.startswith("+") and not part.startswith("joinchat/"):
+                    chat_target = "@" + part
+            if not chat_target.startswith("@") and not chat_target.startswith("-") and not chat_target.startswith("http"):
+                chat_target = "@" + chat_target
+
+        try:
+            member = await bot.get_chat_member(chat_id=chat_target, user_id=user_id)
+            if member.status not in ["creator", "administrator", "member", "restricted"]:
+                logger.info(f"Foydalanuvchi {user_id} kanalda a'zo emas: {chat_target} (status: {member.status})")
+                return False
+        except Exception as e:
+            err_str = str(e).lower()
+            logger.warning(f"Kanal obunasi tekshiruvida xatolik ({chat_target}, user={user_id}): {e}")
+            if "chat not found" in err_str or "bot is not a member" in err_str:
+                # Agar bot kanalda yo'q bo'lsa yoki private link chat_id siz bo'lsa, xatoni o'tkazib yubormaslik
+                continue
+            elif "user not found" in err_str:
+                return False
+            else:
+                return False
     return True
 
 @start_router.message(CommandStart())
@@ -200,7 +247,7 @@ async def cb_check_sub(call: CallbackQuery):
 
     # Foydalanuvchining eslab qolingan so'rovini tekshiramiz
     from handlers.search import PENDING_REQUESTS, execute_search, URL_CACHE, clean_old_url_cache, _get_all_channels
-    from services.music_search import is_url
+    from services.music_search import is_url, extract_url, clean_url
     from keyboards.inline_kb import get_media_choice_keyboard
 
     pending = PENDING_REQUESTS.pop(user.id, None)
@@ -220,14 +267,15 @@ async def cb_check_sub(call: CallbackQuery):
             await call.bot.send_chat_action(call.message.chat.id, ChatAction.TYPING)
 
             from services.music_search import music_service
-            info = await music_service.get_media_info(query)
+            target_clean_url = clean_url(query)
+            info = await music_service.get_media_info(target_clean_url)
             if not info:
-                await status_msg.edit_text("❌ Ushbu havola orqali media topilmadi.")
+                await status_msg.edit_text("❌ Ushbu havola orqali media topilmadi yoki havola yopiq.")
                 return
 
             import time as _time
             url_key = f"u_{user.id}_{int(_time.time() * 1000) % 10000000}"
-            URL_CACHE[url_key] = {"url": query, "info": info, "time": _time.time()}
+            URL_CACHE[url_key] = {"url": target_clean_url, "info": info, "time": _time.time()}
 
             caption = (
                 f"🎬 <b>{info['title']}</b>\n"

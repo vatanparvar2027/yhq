@@ -61,9 +61,15 @@ def build_search_keyboard(results: List[Dict[str, Any]], page: int = 0, per_page
 
 def get_audio_keyboard(video_id: str, title: str) -> InlineKeyboardMarkup:
     """Musiqa yuborilganda ostida chiqadigan qulay tugmalar"""
+    from urllib.parse import quote
+    clean_t = title.replace("\n", " ").strip()[:60]
+    share_text = quote(f"🎧 {clean_t}\n\n🤖 @ChiroqchiMuzbot — Har qanday musiqani tezkor topuvchi bot!")
+    share_url = quote(f"https://t.me/ChiroqchiMuzbot?start=dl_{video_id}")
+    share_link = f"https://t.me/share/url?url={share_url}&text={share_text}"
+
     return InlineKeyboardMarkup(inline_keyboard=[
         [
-            InlineKeyboardButton(text="📤 Do'stlarga ulashish", switch_inline_query=title[:30]),
+            InlineKeyboardButton(text="📤 Do'stlarga ulashish", url=share_link),
             InlineKeyboardButton(text="❤️ Sevimlilar", callback_data=f"fav:{video_id}")
         ],
         [
@@ -71,12 +77,25 @@ def get_audio_keyboard(video_id: str, title: str) -> InlineKeyboardMarkup:
         ]
     ])
 
-def get_channel_sub_keyboard(channels: List[str]) -> InlineKeyboardMarkup:
-    """Majburiy a'zo bo'lish tugmalari"""
+def get_channel_sub_keyboard(channels: List[Any]) -> InlineKeyboardMarkup:
+    """Majburiy a'zo bo'lish tugmalari (ochiq va yopiq kanallarni to'g'ri havolalaydi)"""
     buttons = []
     for i, ch in enumerate(channels, start=1):
-        url = f"https://t.me/{ch.lstrip('@')}" if not ch.startswith("http") else ch
-        buttons.append([InlineKeyboardButton(text=f"➕ {i}-kanalga a'zo bo'lish", url=url)])
+        if isinstance(ch, dict):
+            ch_title = ch.get('title')
+            btn_text = f"➕ {ch_title}" if ch_title else f"➕ {i}-kanalga a'zo bo'lish"
+            raw_url = ch.get('invite_link') or ch.get('username') or ""
+        else:
+            btn_text = f"➕ {i}-kanalga a'zo bo'lish"
+            raw_url = str(ch).strip()
+
+        if raw_url.startswith("http"):
+            url = raw_url
+        else:
+            clean_un = raw_url.replace("https://t.me/", "").lstrip("@")
+            url = f"https://t.me/{clean_un}"
+
+        buttons.append([InlineKeyboardButton(text=btn_text, url=url)])
 
     buttons.append([InlineKeyboardButton(text="✅ A'zo bo'ldim / Tekshirish", callback_data="check_subscription")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)

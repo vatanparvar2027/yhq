@@ -13,6 +13,11 @@ from services.audio_tagger import set_mp3_tags
 
 logger = logging.getLogger(__name__)
 
+URL_FINDER_REGEX = re.compile(
+    r'(https?://(?:www\.)?[-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b[-a-zA-Z0-9()@:%_\+.~#?&//=]*)',
+    re.IGNORECASE
+)
+
 URL_REGEX = re.compile(
     r'^(?:http|ftp)s?://' # http:// or https://
     r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' # domain...
@@ -29,9 +34,75 @@ DEFAULT_HEADERS = {
     'Sec-Fetch-Mode': 'navigate',
 }
 
+def clean_url(url: str) -> str:
+    """
+    Havolani keraksiz tracking va statistika parametrlaridan (stkn, igsh, si, utm_* va b.) tozalash.
+    Instagram, YouTube, TikTok va b. platformalarda yuklash barqarorligini oshiradi.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    url = url.strip()
+    # Oxiridagi ortiqcha tinish belgilarini olib tashlaymiz
+    url = re.sub(r'[\.,;:!?\)\>\]\'"»«]+$', '', url)
+    try:
+        from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+        parsed = urlparse(url)
+        netloc = parsed.netloc.lower()
+
+        # Instagram havolalari (/reel/..., /p/..., /reels/..., /tv/...)
+        if any(d in netloc for d in ["instagram.com", "instagr.am", "ddinstagram.com"]):
+            path = parsed.path
+            if not path.endswith('/'):
+                path += '/'
+            return urlunparse((parsed.scheme or "https", parsed.netloc, path, '', '', ''))
+
+        # YouTube havolalari
+        elif "youtu.be" in netloc:
+            return urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, '', '', ''))
+        elif "youtube.com" in netloc:
+            if "/shorts/" in parsed.path:
+                return urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, '', '', ''))
+            elif "/watch" in parsed.path:
+                qs = parse_qs(parsed.query)
+                v = qs.get('v')
+                if v:
+                    new_query = urlencode({'v': v[0]})
+                    return urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, '', new_query, ''))
+
+        # TikTok havolalari
+        elif "tiktok.com" in netloc:
+            return urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, '', '', ''))
+
+        # Boshqa platformalar uchun keraksiz tracking parametrlarini olib tashlash
+        qs = parse_qs(parsed.query)
+        tracking_params = {'utm_source', 'utm_medium', 'utm_campaign', 'utm_term', 'utm_content', 'fbclid', 'gclid', 'si', 'igsh', 'stkn'}
+        filtered_qs = {k: v for k, v in qs.items() if k.lower() not in tracking_params}
+        new_query = urlencode(filtered_qs, doseq=True) if filtered_qs else ''
+        return urlunparse((parsed.scheme or "https", parsed.netloc, parsed.path, '', new_query, ''))
+    except Exception:
+        return url
+
+def extract_url(text: str) -> Optional[str]:
+    """
+    Har qanday xabar matni, izoh (caption), heshteglar yoki repost ichidan havolani ajratib oladi va tozalaydi.
+    """
+    if not text or not isinstance(text, str):
+        return None
+    # 1. Regex orqali xabar ichidan havolani izlaymiz
+    match = URL_FINDER_REGEX.search(text)
+    if match:
+        found = match.group(1).strip()
+        if found.startswith("www."):
+            found = "https://" + found
+        return clean_url(found)
+    # 2. Agar butun matn to'g'ridan-to'g'ri URL bo'lsa
+    if URL_REGEX.match(text.strip()):
+        return clean_url(text.strip())
+    return None
+
 def is_url(text: str) -> bool:
-    """Matn havola (URL) ekanligini tekshirish"""
-    return bool(URL_REGEX.match(text.strip()))
+    """Matnda to'g'ri havola bor yoki yo'qligini tekshirish"""
+    return extract_url(text) is not None
 
 def format_duration(seconds: Optional[int]) -> str:
     """Soniyani MM:SS yoki HH:MM:SS formatiga o'tkazish"""
@@ -172,17 +243,20 @@ class MusicSearchService:
 
         return results
 
-    def _sync_download(self, target: str, output_id: str) -> Optional[Dict[str, Any]]:
+    def _sync_download(self, target: str, output_id: str, fallback_query: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
-        Tezlashtirilgan ko'p oqimli yuklab olish va FFmpeg konvertatsiya (Multi-tier retry)
+        Tezlashtirilgan ko'p oqimli yuklab olish, FFmpeg konvertatsiya va Smart Fallback tizimi.
+        Agar asosiy target (video_id) cheklangan bo'lsa, fallback_query orqali avtomatik zaxira qidiradi.
         """
         output_template = str(DOWNLOADS_DIR / f"{output_id}.%(ext)s")
         expected_mp3 = str(DOWNLOADS_DIR / f"{output_id}.mp3")
-        url = target if is_url(target) else f"https://www.youtube.com/watch?v={target}"
+        clean_target = clean_url(target) if is_url(target) else target
+        url = clean_target if is_url(clean_target) else f"https://www.youtube.com/watch?v={clean_target}"
+        is_yt = any(d in url.lower() for d in ["youtube.com", "youtu.be"])
 
         def build_dl_opts(clients: Optional[list] = None, with_ffmpeg: bool = True):
             opts = {
-                'format': 'bestaudio/best',
+                'format': 'bestaudio[ext=m4a]/bestaudio[ext=mp3]/bestaudio/best',
                 'outtmpl': output_template,
                 'quiet': True,
                 'no_warnings': True,
@@ -190,7 +264,8 @@ class MusicSearchService:
                 'noplaylist': True,
                 'nocheckcertificate': True,
                 'socket_timeout': 30,
-                'http_headers': DEFAULT_HEADERS,
+                'retries': 3,
+                'fragment_retries': 3,
             }
             if clients:
                 opts['extractor_args'] = {
@@ -211,13 +286,16 @@ class MusicSearchService:
                     opts['ffmpeg_location'] = self.ffmpeg_location
             return opts
 
-        attempts = [
-            (build_dl_opts(['android'], with_ffmpeg=True), "android_mp3"),
-            (build_dl_opts(['android_creator'], with_ffmpeg=True), "android_creator_mp3"),
-            (build_dl_opts(['tv_embedded'], with_ffmpeg=True), "tv_embedded_mp3"),
-            (build_dl_opts(None, with_ffmpeg=True), "default_mp3"),
-            (build_dl_opts(['android'], with_ffmpeg=False), "android_raw"),
-        ]
+        attempts = []
+        if is_yt:
+            attempts.append((build_dl_opts(['ios'], with_ffmpeg=True), "ios_mp3"))
+            attempts.append((build_dl_opts(['android'], with_ffmpeg=True), "android_mp3"))
+            attempts.append((build_dl_opts(['mweb'], with_ffmpeg=True), "mweb_mp3"))
+            attempts.append((build_dl_opts(['web'], with_ffmpeg=True), "web_mp3"))
+            attempts.append((build_dl_opts(['android'], with_ffmpeg=False), "android_raw"))
+        else:
+            attempts.append((build_dl_opts(None, with_ffmpeg=True), "platform_native_mp3"))
+            attempts.append((build_dl_opts(None, with_ffmpeg=False), "platform_raw"))
 
         info = None
         for opts, mode in attempts:
@@ -227,8 +305,25 @@ class MusicSearchService:
                     if info:
                         break
             except Exception as e:
-                logger.warning(f"Audio yuklab olishda ({mode}) urinishi xatosi: {e}")
+                logger.warning(f"Audio yuklashda ({mode}) xatosi: {e}")
                 continue
+
+        # Smart Fallback: agar asosiy URL yuklanmasa va fallback_query bo'lsa
+        if not info and fallback_query:
+            logger.info(f"Smart Fallback ishga tushdi: «{fallback_query}» bo'yicha zaxira qidirilmoqda...")
+            fallback_opts = build_dl_opts(['ios', 'android'], with_ffmpeg=True)
+            fallback_opts['noplaylist'] = False
+            try:
+                with yt_dlp.YoutubeDL(fallback_opts) as ydl:
+                    fallback_info = ydl.extract_info(f"ytsearch3:{fallback_query} audio", download=True)
+                    if fallback_info and 'entries' in fallback_info:
+                        for entry in fallback_info['entries']:
+                            if entry:
+                                info = entry
+                                logger.info(f"Smart Fallback muvaffaqiyatli topdi: {entry.get('title')}")
+                                break
+            except Exception as fe:
+                logger.warning(f"Smart Fallback xatosi: {fe}")
 
         if not info:
             logger.error(f"Barcha audio yuklab olish urinishlari muvaffaqiyatsiz bo'ldi ({target})")
@@ -241,7 +336,11 @@ class MusicSearchService:
             info = entries[0]
 
         video_id = info.get('id') or output_id
-        raw_title = info.get('title') or "Musiqa"
+        raw_title = info.get('title') or info.get('description') or "Musiqa"
+        first_line = raw_title.strip().split('\n')[0].strip()
+        display_title = clean_title(first_line)
+        if len(display_title) > 80:
+            display_title = display_title[:77] + "..."
         artist = (info.get('artist') or info.get('uploader') or "Noma'lum").replace(" - Topic", "").strip()
         duration = int(info.get('duration') or 0)
         thumb_url = info.get('thumbnail')
@@ -258,7 +357,6 @@ class MusicSearchService:
             logger.error(f"Yuklab olingan fayl topilmadi: {output_id}")
             return None
 
-        # Agar MP3 hajmi Telegram limitidan (49MB) katta bo'lsa (konsertlar), uni 46MB ga moslab siqamiz
         file_size = os.path.getsize(mp3_path)
         MAX_TELEGRAM_AUDIO_BYTES = 49 * 1024 * 1024  # 49 MB
         if file_size > MAX_TELEGRAM_AUDIO_BYTES and duration > 0:
@@ -296,43 +394,94 @@ class MusicSearchService:
         return {
             'id': video_id,
             'file_path': mp3_path,
-            'title': clean_title(raw_title),
+            'title': display_title or "Musiqa",
             'artist': artist,
             'duration': duration,
             'thumbnail_url': thumb_url
         }
 
-    async def download(self, target: str, output_id: str, thumb_url_hint: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    async def download(
+        self,
+        target: str,
+        output_id: str,
+        thumb_url_hint: Optional[str] = None,
+        fallback_query: Optional[str] = None,
+        cover_url: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         """
-        Asinxron yuklab olish + bot avatari bilan muqovalash
+        Asinxron yuklab olish + Smart Fallback + HD muqova va ID3 teglash
         """
-        # Audio faylni yuklab olamiz
-        data = await asyncio.to_thread(self._sync_download, target, output_id)
+        data = await asyncio.to_thread(self._sync_download, target, output_id, fallback_query)
         if not data or not os.path.exists(data['file_path']):
             return None
 
-        # Har doim botning rasmiy avatarini MP3 muqovasi (cover art) sifatida o'rnatamiz
-        bot_logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot_avatar.jpg")
-        if not os.path.exists(bot_logo_path):
-            bot_logo_path = "bot_avatar.jpg"
+        chosen_cover_path = None
+        temp_cover_file = None
+        if cover_url and cover_url.startswith("http"):
+            try:
+                temp_cover_file = str(DOWNLOADS_DIR / f"cover_{output_id}.jpg")
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(cover_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        if resp.status == 200:
+                            content = await resp.read()
+                            with open(temp_cover_file, "wb") as f:
+                                f.write(content)
+                            if os.path.exists(temp_cover_file) and os.path.getsize(temp_cover_file) > 1000:
+                                chosen_cover_path = temp_cover_file
+            except Exception as ce:
+                logger.warning(f"Cover rasmini yuklab olishda xatolik: {ce}")
 
-        actual_thumb_path = bot_logo_path if os.path.exists(bot_logo_path) else None
+        if not chosen_cover_path:
+            bot_logo_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bot_avatar.jpg")
+            if not os.path.exists(bot_logo_path):
+                bot_logo_path = "bot_avatar.jpg"
+            if os.path.exists(bot_logo_path):
+                chosen_cover_path = bot_logo_path
 
-        # ID3 teglarni asinxron oqimda o'rnatamiz (Artist nomiga @ChiroqchiMuzbot, muqovaga botning rasmi)
         await asyncio.to_thread(
             set_mp3_tags,
             file_path=data['file_path'],
             title=data['title'],
             artist="@ChiroqchiMuzbot",
-            cover_path=actual_thumb_path
+            cover_path=chosen_cover_path
         )
 
-        data['cover_path'] = actual_thumb_path
+        data['cover_path'] = chosen_cover_path
+        data['temp_cover'] = temp_cover_file
         return data
+
+    async def download_by_query(
+        self,
+        query: str,
+        output_id: str,
+        cover_url: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """
+        To'g'ridan-to'g'ri qo'shiq nomi bo'yicha eng yaxshi audioni topib yuklash (Shazam uchun tezkor)
+        """
+        search_results = await self.search(query, limit=3)
+        target = None
+        thumb_hint = None
+        if search_results:
+            target = search_results[0]['id']
+            thumb_hint = search_results[0].get('thumbnail')
+        else:
+            target = f"ytsearch1:{query}"
+
+        return await self.download(
+            target=target,
+            output_id=output_id,
+            thumb_url_hint=thumb_hint,
+            fallback_query=query,
+            cover_url=cover_url
+        )
 
     def _sync_get_media_info(self, url: str) -> Optional[Dict[str, Any]]:
         """Havola haqida tezkor ma'lumot olish (YouTube, TikTok, Instagram va boshqa platformalar)"""
-        def make_opts(player_clients=None):
+        clean_target_url = clean_url(url)
+        is_yt = any(d in clean_target_url.lower() for d in ["youtube.com", "youtu.be"])
+
+        def make_opts(player_clients=None, headers=None):
             opts = {
                 'quiet': True,
                 'no_warnings': True,
@@ -340,8 +489,9 @@ class MusicSearchService:
                 'ignoreerrors': False,
                 'nocheckcertificate': True,
                 'socket_timeout': 30,
-                'http_headers': DEFAULT_HEADERS,
             }
+            if headers:
+                opts['http_headers'] = headers
             if player_clients:
                 opts['extractor_args'] = {
                     'youtube': {
@@ -352,25 +502,29 @@ class MusicSearchService:
                 opts['ffmpeg_location'] = self.ffmpeg_location
             return opts
 
-        info = None
-        attempts = [
-            make_opts(['android']),
-            make_opts(['android_creator']),
-            make_opts(None),
-        ]
+        attempts = []
+        if is_yt:
+            attempts.append(make_opts(['android'], headers=DEFAULT_HEADERS))
+            attempts.append(make_opts(['android_creator'], headers=DEFAULT_HEADERS))
+            attempts.append(make_opts(None, headers=DEFAULT_HEADERS))
+        else:
+            # Instagram, TikTok va b. platformalar: yt-dlp native headers birinchi, keyin DEFAULT_HEADERS
+            attempts.append(make_opts(None, headers=None))
+            attempts.append(make_opts(None, headers=DEFAULT_HEADERS))
 
+        info = None
         for opts in attempts:
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
+                    info = ydl.extract_info(clean_target_url, download=False)
                     if info:
                         break
             except Exception as e:
-                logger.warning(f"Media ma'lumotini olishda ogohlantirish ({url}): {e}")
+                logger.warning(f"Media ma'lumotini olishda ogohlantirish ({clean_target_url}): {e}")
                 continue
 
         if not info:
-            logger.error(f"Media ma'lumoti topilmadi ({url})")
+            logger.error(f"Media ma'lumoti topilmadi ({clean_target_url})")
             return None
 
         if 'entries' in info:
@@ -379,7 +533,12 @@ class MusicSearchService:
                 return None
             info = entries[0]
 
-        raw_title = info.get('title') or "Video"
+        raw_title = info.get('title') or info.get('description') or "Video"
+        first_line = raw_title.strip().split('\n')[0].strip()
+        display_title = clean_title(first_line)
+        if len(display_title) > 80:
+            display_title = display_title[:77] + "..."
+
         artist = (info.get('artist') or info.get('uploader') or info.get('channel') or "Noma'lum").replace(" - Topic", "").strip()
         duration = int(info.get('duration') or 0)
         duration_str = format_duration(duration)
@@ -396,14 +555,14 @@ class MusicSearchService:
 
         return {
             'id': video_id,
-            'title': clean_title(raw_title),
+            'title': display_title or "Media",
             'raw_title': raw_title,
             'artist': artist,
             'duration': duration,
             'duration_str': duration_str,
             'thumbnail': thumb,
             'available_heights': sorted(list(heights), reverse=True),
-            'url': url
+            'url': clean_target_url
         }
 
     async def get_media_info(self, url: str) -> Optional[Dict[str, Any]]:
@@ -417,18 +576,21 @@ class MusicSearchService:
         """
         import glob
 
+        clean_target_url = clean_url(url)
+        is_yt = any(d in clean_target_url.lower() for d in ["youtube.com", "youtu.be"])
+
         if max_height >= 2160:
-            fmt = 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/bestvideo+bestaudio/best'
+            fmt = 'bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=2160]+bestaudio/best[height<=2160]/bestvideo+bestaudio/best'
         elif max_height >= 1080:
-            fmt = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best'
+            fmt = 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/bestvideo+bestaudio/best'
         elif max_height >= 720:
-            fmt = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/bestvideo+bestaudio/best'
+            fmt = 'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]/bestvideo+bestaudio/best'
         else:
-            fmt = 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/bestvideo+bestaudio/best'
+            fmt = 'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=480]+bestaudio/best[height<=480]/bestvideo+bestaudio/best'
 
         output_template = str(DOWNLOADS_DIR / f"{output_id}.%(ext)s")
 
-        def build_video_opts(clients: Optional[list] = None):
+        def build_video_opts(clients: Optional[list] = None, headers: Optional[dict] = None):
             ydl_opts = {
                 'format': fmt,
                 'outtmpl': output_template,
@@ -440,11 +602,12 @@ class MusicSearchService:
                 'nocheckcertificate': True,
                 'socket_timeout': 45,
                 'retries': 3,
-                'http_headers': DEFAULT_HEADERS,
                 'postprocessor_args': {
                     'Merger': ['-threads', '4']
                 }
             }
+            if headers:
+                ydl_opts['http_headers'] = headers
             if clients:
                 ydl_opts['extractor_args'] = {
                     'youtube': {
@@ -455,21 +618,24 @@ class MusicSearchService:
                 ydl_opts['ffmpeg_location'] = self.ffmpeg_location
             return ydl_opts
 
-        attempts = [
-            build_video_opts(['android']),
-            build_video_opts(['android_creator']),
-            build_video_opts(None),
-        ]
+        attempts = []
+        if is_yt:
+            attempts.append(build_video_opts(['android'], headers=DEFAULT_HEADERS))
+            attempts.append(build_video_opts(['android_creator'], headers=DEFAULT_HEADERS))
+            attempts.append(build_video_opts(None, headers=DEFAULT_HEADERS))
+        else:
+            attempts.append(build_video_opts(None, headers=None))
+            attempts.append(build_video_opts(None, headers=DEFAULT_HEADERS))
 
         info = None
         for opts in attempts:
             try:
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=True)
+                    info = ydl.extract_info(clean_target_url, download=True)
                     if info:
                         break
             except Exception as e:
-                logger.warning(f"Video yuklab olishda xatolik: {e}")
+                logger.warning(f"Video yuklab olishda xatolik ({clean_target_url}): {e}")
                 continue
 
         if not info:
@@ -481,7 +647,12 @@ class MusicSearchService:
             info = entries[0]
 
         try:
-            raw_title = info.get('title') or "Video"
+            raw_title = info.get('title') or info.get('description') or "Video"
+            first_line = raw_title.strip().split('\n')[0].strip()
+            display_title = clean_title(first_line)
+            if len(display_title) > 80:
+                display_title = display_title[:77] + "..."
+
             duration = int(info.get('duration') or 0)
             thumb = info.get('thumbnail')
             width = info.get('width')
@@ -511,7 +682,7 @@ class MusicSearchService:
 
             return {
                 'file_path': video_path,
-                'title': clean_title(raw_title),
+                'title': display_title or "Video",
                 'duration': duration,
                 'width': width or 1280,
                 'height': height or 720,
@@ -519,7 +690,7 @@ class MusicSearchService:
                 'thumbnail_url': thumb
             }
         except Exception as e:
-            logger.error(f"Videoni yuklashda xatolik ({url}, {max_height}p): {e}")
+            logger.error(f"Videoni yuklashda xatolik ({clean_target_url}, {max_height}p): {e}")
             for leftover in glob.glob(str(DOWNLOADS_DIR / f"{output_id}.*")):
                 try:
                     os.remove(leftover)
